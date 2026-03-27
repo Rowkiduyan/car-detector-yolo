@@ -35,6 +35,7 @@ import platform
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 FILE = Path(__file__).resolve()
@@ -64,6 +65,11 @@ from utils.general import (
     xyxy2xywh,
 )
 from utils.torch_utils import select_device, smart_inference_mode
+
+try:
+    import supervision as sv
+except ImportError:
+    sv = None
 
 
 @smart_inference_mode()
@@ -97,6 +103,9 @@ def run(
     half=False,  # use FP16 half-precision inference
     dnn=False,  # use OpenCV DNN for ONNX inference
     vid_stride=1,  # video frame-rate stride
+    tracker="bytetrack",  # tracker backend: bytetrack or iou
+    track_buffer=30,  # tracker lost track buffer (frames)
+    track_match_thresh=0.8,  # tracker association threshold
 ):
     """Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
 
@@ -156,6 +165,20 @@ def run(
     if is_url and is_file:
         source = check_file(source)  # download
 
+    def iou_xyxy(box1, box2):
+        """Computes IoU for two boxes in xyxy format."""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        inter_w = max(0.0, x2 - x1)
+        inter_h = max(0.0, y2 - y1)
+        inter = inter_w * inter_h
+        area1 = max(0.0, box1[2] - box1[0]) * max(0.0, box1[3] - box1[1])
+        area2 = max(0.0, box2[2] - box2[0]) * max(0.0, box2[3] - box2[1])
+        union = area1 + area2 - inter
+        return inter / union if union > 0 else 0.0
+
     # Directories
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
     (save_dir / "labels" if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
@@ -181,6 +204,27 @@ def run(
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
+    tracked_classes = {2: "Cars", 5: "Buses", 7: "Trucks", 3: "Motorcycles"}
+    unique_vehicle_count = {k: 0 for k in tracked_classes}
+
+    tracker = tracker.lower()
+    use_bytetrack = tracker == "bytetrack" and sv is not None
+    if tracker == "bytetrack" and sv is None:
+        LOGGER.warning("ByteTrack requested but 'supervision' is not installed. Falling back to IoU tracking.")
+
+    if use_bytetrack:
+        byte_tracker = sv.ByteTrack(
+            track_activation_threshold=conf_thres,
+            lost_track_buffer=track_buffer,
+            minimum_matching_threshold=track_match_thresh,
+            frame_rate=30,
+        )
+        counted_track_ids = {k: set() for k in tracked_classes}
+
+    tracks = {}
+    next_track_id = 0
+    iou_match_threshold = 0.3
+    max_missed_frames = 20
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
@@ -241,6 +285,8 @@ def run(
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            vehicle_dets = []
+            vehicle_boxes, vehicle_scores, vehicle_classes = [], [], []
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -252,7 +298,16 @@ def run(
 
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
-                    c = int(cls)  # integer class
+                    if int(cls) not in [2, 3, 5, 7]:
+                        continue
+                    box = [float(v) for v in xyxy]
+                    cls_int = int(cls)
+                    vehicle_dets.append({"bbox": box, "cls": cls_int})
+                    vehicle_boxes.append(box)
+                    vehicle_scores.append(float(conf))
+                    vehicle_classes.append(cls_int)
+                    
+                    c = cls_int  # integer class
                     label = names[c] if hide_conf else f"{names[c]}"
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
@@ -278,8 +333,73 @@ def run(
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
 
+            # Track vehicles across frames and count each unique track once.
+            if use_bytetrack:
+                if vehicle_boxes:
+                    detections = sv.Detections(
+                        xyxy=np.array(vehicle_boxes, dtype=np.float32),
+                        confidence=np.array(vehicle_scores, dtype=np.float32),
+                        class_id=np.array(vehicle_classes, dtype=np.int32),
+                    )
+                else:
+                    detections = sv.Detections(
+                        xyxy=np.empty((0, 4), dtype=np.float32),
+                        confidence=np.empty((0,), dtype=np.float32),
+                        class_id=np.empty((0,), dtype=np.int32),
+                    )
+
+                tracked = byte_tracker.update_with_detections(detections)
+                if tracked.tracker_id is not None:
+                    for cls_id, track_id in zip(tracked.class_id, tracked.tracker_id):
+                        cls_id = int(cls_id)
+                        track_id = int(track_id)
+                        if cls_id in tracked_classes and track_id not in counted_track_ids[cls_id]:
+                            counted_track_ids[cls_id].add(track_id)
+                            unique_vehicle_count[cls_id] += 1
+            else:
+                for track in tracks.values():
+                    track["matched"] = False
+
+                for det_obj in vehicle_dets:
+                    best_track_id = None
+                    best_iou = 0.0
+                    for tid, track in tracks.items():
+                        if track["cls"] != det_obj["cls"]:
+                            continue
+                        iou = iou_xyxy(track["bbox"], det_obj["bbox"])
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_track_id = tid
+
+                    if best_track_id is not None and best_iou >= iou_match_threshold:
+                        tracks[best_track_id]["bbox"] = det_obj["bbox"]
+                        tracks[best_track_id]["missed"] = 0
+                        tracks[best_track_id]["matched"] = True
+                    else:
+                        tracks[next_track_id] = {
+                            "bbox": det_obj["bbox"],
+                            "cls": det_obj["cls"],
+                            "missed": 0,
+                            "matched": True,
+                        }
+                        unique_vehicle_count[det_obj["cls"]] += 1
+                        next_track_id += 1
+
+                stale_track_ids = []
+                for tid, track in tracks.items():
+                    if not track["matched"]:
+                        track["missed"] += 1
+                    if track["missed"] > max_missed_frames:
+                        stale_track_ids.append(tid)
+                for tid in stale_track_ids:
+                    del tracks[tid]
+
             # Stream results
             im0 = annotator.result()
+            cv2.putText(im0, f"Unique Cars: {unique_vehicle_count[2]}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+            cv2.putText(im0, f"Unique Buses: {unique_vehicle_count[5]}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+            cv2.putText(im0, f"Unique Trucks: {unique_vehicle_count[7]}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+            cv2.putText(im0, f"Unique Motorcycles: {unique_vehicle_count[3]}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
             if view_img:
                 if platform.system() == "Linux" and p not in windows:
                     windows.append(p)
@@ -399,6 +519,9 @@ def parse_opt():
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
     parser.add_argument("--vid-stride", type=int, default=1, help="video frame-rate stride")
+    parser.add_argument("--tracker", type=str, default="bytetrack", choices=["bytetrack", "iou"], help="tracker backend")
+    parser.add_argument("--track-buffer", type=int, default=30, help="tracker lost track buffer in frames")
+    parser.add_argument("--track-match-thresh", type=float, default=0.8, help="tracker association threshold")
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
