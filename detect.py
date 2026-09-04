@@ -306,7 +306,7 @@ def run(
                     vehicle_boxes.append(box)
                     vehicle_scores.append(float(conf))
                     vehicle_classes.append(cls_int)
-                    
+
                     c = cls_int  # integer class
                     label = names[c] if hide_conf else f"{names[c]}"
                     confidence = float(conf)
@@ -396,10 +396,42 @@ def run(
 
             # Stream results
             im0 = annotator.result()
-            cv2.putText(im0, f"Unique Cars: {unique_vehicle_count[2]}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
-            cv2.putText(im0, f"Unique Buses: {unique_vehicle_count[5]}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
-            cv2.putText(im0, f"Unique Trucks: {unique_vehicle_count[7]}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
-            cv2.putText(im0, f"Unique Motorcycles: {unique_vehicle_count[3]}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+            cv2.putText(
+                im0,
+                f"Unique Cars: {unique_vehicle_count[2]}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 200, 255),
+                2,
+            )
+            cv2.putText(
+                im0,
+                f"Unique Buses: {unique_vehicle_count[5]}",
+                (20, 70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 200, 255),
+                2,
+            )
+            cv2.putText(
+                im0,
+                f"Unique Trucks: {unique_vehicle_count[7]}",
+                (20, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 200, 255),
+                2,
+            )
+            cv2.putText(
+                im0,
+                f"Unique Motorcycles: {unique_vehicle_count[3]}",
+                (20, 130),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 200, 255),
+                2,
+            )
             if view_img:
                 if platform.system() == "Linux" and p not in windows:
                     windows.append(p)
@@ -519,7 +551,9 @@ def parse_opt():
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
     parser.add_argument("--vid-stride", type=int, default=1, help="video frame-rate stride")
-    parser.add_argument("--tracker", type=str, default="bytetrack", choices=["bytetrack", "iou"], help="tracker backend")
+    parser.add_argument(
+        "--tracker", type=str, default="bytetrack", choices=["bytetrack", "iou"], help="tracker backend"
+    )
     parser.add_argument("--track-buffer", type=int, default=30, help="tracker lost track buffer in frames")
     parser.add_argument("--track-match-thresh", type=float, default=0.8, help="tracker association threshold")
     opt = parser.parse_args()
